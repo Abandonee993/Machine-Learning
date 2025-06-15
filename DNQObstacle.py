@@ -9,11 +9,12 @@ from matplotlib import colors
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 from matplotlib.animation import FuncAnimation
+import time
 
 GRID_ROWS = 8           # 网格行数
 GRID_COLS = 8           # 网格列数
 NUM_AGENTS = 4          # 智能体个数
-NUM_EPISODES = 300      # 训练轮数
+NUM_EPISODES = 400      # 训练轮数
 
 # ----------------------------------------
 # 第一部分：定义 TrafficRoutingEnv 环境（加入固定障碍物）
@@ -145,6 +146,9 @@ class TrafficRoutingEnv:
                 for a in agents:
                     collision_blocked.add(a)
 
+        # 统计碰撞次数
+        num_collisions = len(swap_blocked) + len(collision_blocked)
+
         # 5. 合并所有需要阻塞的智能体
         blocked = swap_blocked.union(collision_blocked)
 
@@ -195,7 +199,7 @@ class TrafficRoutingEnv:
 
         # 9. 回合结束标志
         done = all(dones.values()) or (self.steps >= 50)
-        return self._get_observations(), shaped_rewards, done, {}
+        return self._get_observations(), shaped_rewards, done, {}, num_collisions
 
     def render(self):
         # 可视化网格、障碍物、智能体和目标
@@ -352,6 +356,11 @@ class MADQNTrainer:
 
         self.steps_done = 0
 
+        # 新增：用于记录loss和碰撞次数的容器
+        self.loss_history = {i: [] for i in range(num_agents)}  # 每个agent的loss历史
+        self.collision_history = []  # 每回合的碰撞次数
+        self.episode_collisions = 0  # 当前回合的碰撞计数
+
     def select_action(self, agent_id, state, eps, done):
         """
         ε-贪心策略选择动作
@@ -374,7 +383,7 @@ class MADQNTrainer:
         """
         buffer = self.replay_buffers[agent_id]
         if len(buffer) < self.batch_size:
-            return
+            return None  # 返回None表示没有更新
 
         states, actions, rewards, next_states, dones = buffer.sample(self.batch_size)
 
@@ -402,12 +411,66 @@ class MADQNTrainer:
         loss.backward()
         self.optimizers[agent_id].step()
 
+        # 在反向传播后记录loss
+        loss_value = loss.item()
+        self.loss_history[agent_id].append(loss_value)
+    
+        return loss_value  # 返回loss值
+
     def update_targets(self):
         """
         将 policy 网络的权重复制到 target 网络
         """
         for i in range(self.num_agents):
             self.target_nets[i].load_state_dict(self.policy_nets[i].state_dict())
+
+    def _plot_training_stats(self, returns, losses, collisions):
+        """绘制训练统计图：回报、loss和碰撞次数"""
+        plt.figure(figsize=(15, 5))
+    
+        # 计算移动平均（窗口大小为10）
+        window_size = 10
+        returns_smooth = np.convolve(returns, np.ones(window_size)/window_size, mode='valid')
+        losses_smooth = np.convolve([x for x in losses if x > 0], np.ones(window_size)/window_size, mode='valid')
+        collisions_smooth = np.convolve(collisions, np.ones(window_size)/window_size, mode='valid')
+    
+        # 1. 回报曲线（原始数据+平滑曲线）
+        plt.subplot(1, 3, 1)
+        plt.plot(returns, alpha=0.3, label="Raw Return")
+        plt.plot(range(window_size-1, len(returns)), returns_smooth, label=f"MA({window_size}) Return", color='blue')
+        plt.xlabel("Episode")
+        plt.ylabel("Total Reward")
+        plt.title("Training Returns")
+        plt.legend()
+        plt.grid(True)
+    
+        # 2. Loss曲线（只绘制有效loss点）
+        valid_losses = [x for x in losses if x > 0]
+        plt.subplot(1, 3, 2)
+        plt.plot(valid_losses, alpha=0.3, label="Raw Loss", color='orange')
+        plt.plot(range(window_size-1, len(valid_losses)), losses_smooth, 
+                 label=f"MA({window_size}) Loss", color='orange')
+        plt.xlabel("Episode")
+        plt.ylabel("Average Loss")
+        plt.title("Training Loss")
+        plt.legend()
+        plt.grid(True)
+    
+        # 3. 碰撞次数曲线（原始数据+平滑曲线）
+        plt.subplot(1, 3, 3)
+        plt.plot(collisions, alpha=0.3, label="Raw Collisions", color='red')
+        plt.plot(range(window_size-1, len(collisions)), collisions_smooth, 
+                 label=f"MA({window_size}) Collisions", color='red')
+        plt.xlabel("Episode")
+        plt.ylabel("Collisions per Episode")
+        plt.title("Collision Count")
+        plt.legend()
+        plt.grid(True)
+    
+        plt.tight_layout()
+        plt.savefig('training_results/DQNObstacle.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
 
     def train(self, num_episodes=200, max_steps=50,
               eps_start=1.0, eps_end=0.05, eps_decay=0.995):
@@ -416,6 +479,13 @@ class MADQNTrainer:
         """
         eps = eps_start
         episode_returns = []
+        avg_loss_history = []  # 新增：每回合平均loss
+
+        # 新增：收敛评估变量
+        start_time = time.time()  # 记录训练开始时间
+        convergence_episode = None  # 收敛轮次
+        convergence_threshold = 0.9  # 定义收敛阈值（可根据实际情况调整）
+        max_return = 0  # 记录最大回报
 
         for episode in range(1, num_episodes + 1):
             # 重置环境，并初始化 done_dict
@@ -423,6 +493,7 @@ class MADQNTrainer:
             state_dict = obs_to_state(obs, self.env.grid_size)
             done_dict = {i: False for i in range(self.num_agents)}
             total_reward = 0
+            self.episode_collisions = 0  # 重置碰撞计数器
 
             for step in range(max_steps):
                 actions = {}
@@ -431,7 +502,8 @@ class MADQNTrainer:
                     actions[i] = self.select_action(i, state_dict[i], eps, done_dict[i])
 
                 # 与环境交互
-                next_obs, rewards, done_all, _ = self.env.step(actions)
+                next_obs, rewards, done_all, _, num_collisions = self.env.step(actions)
+                self.episode_collisions += num_collisions
                 next_state_dict = obs_to_state(next_obs, self.env.grid_size)
 
                 # 存储 transition、更新 done_dict
@@ -461,7 +533,28 @@ class MADQNTrainer:
                 if done_all:
                     break
 
+             # 在回合结束后记录数据
             episode_returns.append(total_reward)
+            self.collision_history.append(self.episode_collisions)
+
+            # 更新最大回报
+            if total_reward > max_return:
+                max_return = total_reward
+        
+            # 检查是否收敛（连续10回合平均回报达到最大可能回报的90%）
+            if len(episode_returns) >= 10 and convergence_episode is None:
+                recent_avg = np.mean(episode_returns[-10:])
+                if recent_avg >= max_return * convergence_threshold:
+                    convergence_episode = episode
+                    convergence_time = time.time() - start_time
+        
+            # 计算本回合的平均loss
+            episode_losses = []
+            for i in range(self.num_agents):
+                if self.loss_history[i]:  # 只取本回合的loss
+                    episode_losses.append(np.mean(self.loss_history[i][-max_steps:]))
+            avg_loss = np.mean(episode_losses) if episode_losses else 0.0
+            avg_loss_history.append(avg_loss)
 
             # ε 衰减
             eps = max(eps * eps_decay, eps_end)
@@ -470,136 +563,31 @@ class MADQNTrainer:
             if episode % self.target_update == 0:
                 self.update_targets()
 
-            # 每 10 回合打印一次平均回报
+            # 每10回合打印一次平均回报、loss和碰撞次数
             if episode % 10 == 0:
                 last10_avg = np.mean(episode_returns[-10:])
+                last10_loss = np.mean(avg_loss_history[-10:])
+                last10_coll = np.mean(self.collision_history[-10:])
                 print(f"Episode {episode}/{num_episodes}, "
                       f"Epsilon: {eps:.3f}, "
-                      f"AvgReturn(last10): {last10_avg:.2f}")
+                      f"AvgReturn(last10): {last10_avg:.2f}, "
+                      f"AvgLoss(last10): {last10_loss:.4f}, "
+                      f"AvgCollisions(last10): {last10_coll:.1f}")
 
-        # 训练完成后绘制回合回报曲线
-        """
-        plt.figure(figsize=(8, 4))
-        plt.plot(episode_returns, label="Episode Return")
-        plt.xlabel("Episode")
-        plt.ylabel("Total Reward")
-        plt.title("Training Curve: Episode Return over Time")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-        """
+        # 训练完成后输出收敛评估结果,绘制统计图
+        if convergence_episode is not None:
+            print(f"\n算法在 {convergence_episode} 轮后收敛，花费时间: {convergence_time:.2f} 秒")
+            print(f"最终10轮平均回报: {np.mean(episode_returns[-10:]):.2f}")
+        else:
+            print("\n算法在指定轮数内未达到收敛标准")
+            print(f"最终10轮平均回报: {np.mean(episode_returns[-10:]):.2f}")
+        self._plot_training_stats(episode_returns, avg_loss_history, self.collision_history)
+    
+        return episode_returns
 
 
 
 
-def plot_greedy_trajectories(trainer, env):
-    """
-    可视化函数：展示贪心策略下的多智能体轨迹，
-    障碍物绘制为填满整个格子，并在图例中说明起点、终点和障碍物的形状。
-    """
-    H, W = env.grid_size
-    agent_trajectories = {i: [] for i in range(env.num_agents)}
-    done_dict = {i: False for i in range(env.num_agents)}
-
-    obs = env.reset()
-    state_dict = obs_to_state(obs, env.grid_size)
-    for i in range(env.num_agents):
-        agent_trajectories[i].append(env.agent_positions[i])
-
-    done = False
-    step = 0
-    while not done and step < 50:
-        actions = {
-            i: trainer.select_action(i, state_dict[i], eps=0.0, done=done_dict[i])
-            for i in range(env.num_agents)
-        }
-        next_obs, rewards, done, _ = env.step(actions)
-        next_state_dict = obs_to_state(next_obs, env.grid_size)
-
-        for i in range(env.num_agents):
-            if rewards[i] == 10 or env.agent_positions[i] == env.destinations[i]:
-                done_dict[i] = True
-            agent_trajectories[i].append(env.agent_positions[i])
-
-        state_dict = next_state_dict
-        step += 1
-
-    print("Final Greedy Trajectories (row, col) for each agent:")
-    for i, traj in agent_trajectories.items():
-        print(f"Agent {i}: {traj}")
-
-    plt.figure(figsize=(6, 6))
-    ax = plt.gca()
-
-    # 1. 绘制网格线
-    for x in range(H + 1):
-        ax.plot([0, W], [x, x], color='gray', linewidth=0.5)
-    for y in range(W + 1):
-        ax.plot([y, y], [0, H], color='gray', linewidth=0.5)
-
-    # 2. 绘制障碍物（填满整个格子）
-    for (ox, oy) in env.obstacles:
-        # 注意：要将行列坐标转换为绘图坐标系：x 对应列索引，y 对应 H - 1 - 行索引
-        rect = Rectangle((oy, H - 1 - ox), 1, 1, facecolor='black', edgecolor='black')
-        ax.add_patch(rect)
-
-    # 3. 绘制每个智能体的轨迹、起点和终点
-    base_colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k', '#FFA500']
-    colors_list = [base_colors[i % len(base_colors)] for i in range(env.num_agents)]
-
-    for i, traj in agent_trajectories.items():
-        # 轨迹线
-        xs = [pos[1] + 0.5 for pos in traj]
-        ys = [(H - 1 - pos[0]) + 0.5 for pos in traj]
-        ax.plot(xs, ys, marker='o', color=colors_list[i], label=f"Agent {i}")
-
-        # 起点：方形标记
-        start = traj[0]
-        sx, sy = start[1] + 0.5, (H - 1 - start[0]) + 0.5
-        ax.scatter([sx], [sy],
-                   color=colors_list[i],
-                   marker='s',
-                   s=80)
-
-        # 终点：星形标记
-        goal = env.destinations[i]
-        gx, gy = goal[1] + 0.5, (H - 1 - goal[0]) + 0.5
-        ax.scatter([gx], [gy],
-                   color=colors_list[i],
-                   marker='*',
-                   s=120)
-
-    ax.set_xlim(0, W)
-    ax.set_ylim(0, H)
-    ax.set_aspect('equal')
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    # 4. 自定义图例（Legend）
-    legend_elements = [
-        # 障碍物：黑色实心方块
-        Rectangle((0, 0), 1, 1, facecolor='black', edgecolor='black', label='Obstacle'),
-        # 起点：灰色空心方块（示意所有智能体的起点形状）
-        Line2D([0], [0], marker='s', color='gray', label='Start',
-               markerfacecolor='none', linestyle='None', markersize=10),
-        # 终点：灰色空心星形（示意所有智能体的终点形状）
-        Line2D([0], [0], marker='*', color='gray', label='Goal',
-               markerfacecolor='none', linestyle='None', markersize=12)
-    ]
-    # 再添加每个 Agent 的轨迹图例
-    for i, color in enumerate(colors_list):
-        legend_elements.append(
-            Line2D([0], [0], color=color, lw=2, label=f'Agent {i}')
-        )
-
-    ax.legend(handles=legend_elements,
-              bbox_to_anchor=(1.01, 1),
-              loc='upper left',
-              fontsize=9)
-
-    plt.title("Multi-Agent Trajectories (Greedy Policy) with Obstacles")
-    plt.tight_layout()
-    plt.show()
 
 def animate(trainer, env):
     """
@@ -627,7 +615,7 @@ def animate(trainer, env):
             i: trainer.select_action(i, state_dict[i], eps=0.0, done=done_dict[i])
             for i in range(env.num_agents)
         }
-        next_obs, rewards, done, _ = env.step(actions)
+        next_obs, rewards, done, _, num_collisions = env.step(actions)
         next_state_dict = obs_to_state(next_obs, env.grid_size)
         
         for i in range(env.num_agents):
